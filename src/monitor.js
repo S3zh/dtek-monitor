@@ -27,6 +27,9 @@ import {
   saveLastMessage,
 } from "./helpers.js"
 
+import fs from "node:fs"
+import { createHash } from "node:crypto"
+
 let getInfoRetries = 0
 let sendNotificationRetries = 0
 
@@ -77,8 +80,35 @@ async function getInfo() {
 
     if (!info?.data) throw Error("power outage info missed")
 
+    // чекаємо, поки скрипти сайту намалюють фактичний графік
+    let factTables = null
+    try {
+      await fillAddress(browserPage)
+
+      await browserPage.waitForSelector(
+        "#discon-fact-tables, .discon-fact-tables",
+        { state: "visible", timeout: 15000 }
+      )
+      await browserPage.waitForTimeout(1000)
+
+      const parts = await captureFactTables(browserPage)
+
+      if (parts.length) {
+        factTables = {
+          // rel входить у хеш, щоб поява завтрашнього графіка теж вважалась зміною
+          text: parts.map((p) => `${p.rel}\n${p.text}`).join("\n---\n"),
+          image:
+            parts.length === 1
+              ? parts[0].image
+              : await stitchImages(browser, parts),
+          days: parts.length,
+        }
+      }
+    } catch (error) {
+      console.log(`🟡 Fact tables not found: ${error.message}`)
+    }
     console.log("✅ Getting info finished.")
-    return info
+    return { ...info, factTables }
   } catch (error) {
     console.error(`❌ Getting info failed: ${error.message}.`)
   } finally {
@@ -94,6 +124,69 @@ async function getInfo() {
 
   throw Error(`❌ Getting info failed after ${RETRIES_MAX_COUNT} retries.`)
 }
+
+async function closeModal(page) {
+  const modal = page.locator("#modal-attention.is-open")
+
+  try {
+    await modal.waitFor({ state: "visible", timeout: 5000 })
+  } catch {
+    return // попапа немає, нічого закривати
+  }
+
+  // кнопка закриття всередині діалогу (не оверлей)
+  const closeBtn = modal
+    .locator(".modal__container .modal__close")
+    .first()
+
+  if (await closeBtn.count()) {
+    await closeBtn.click()
+  } else {
+    await page.keyboard.press("Escape")
+  }
+
+  await modal.waitFor({ state: "hidden", timeout: 5000 }).catch(() => {})
+}
+
+// контейнер із полями форми графіка (а не форма скарг)
+const FORM = ".discon-inputs"
+
+async function fillAutocomplete(page, id, value) {
+  const scope = page.locator(FORM).first()
+  const input = scope.locator(`#${id}`).first()
+
+  await page.waitForFunction(
+    ({ form, inputId }) => {
+      const root = document.querySelector(form)
+      return root && !root.querySelector(`#${inputId}`)?.disabled
+    },
+    { form: FORM, inputId: id },
+    { timeout: 15000 }
+  )
+
+  await input.click()
+  await input.fill("")
+  await input.pressSequentially(value, { delay: 60 })
+
+  const items = scope.locator(`#${id}autocomplete-list > div`)
+  await items.first().waitFor({ state: "visible", timeout: 15000 })
+
+  // точний збіг за прихованим value, інакше перший пункт
+  const exact = items.filter({
+    has: page.locator(`input[type="hidden"][value="${value}"]`),
+  })
+  const target = (await exact.count()) ? exact.first() : items.first()
+  await target.click()
+}
+
+async function fillAddress(page) {
+  await page.evaluate(() => document.getElementById("modal-attention")?.remove())
+
+  if (REGION !== "k") await fillAutocomplete(page, "city", CITY)
+  await fillAutocomplete(page, "street", STREET)
+  await fillAutocomplete(page, "house_num", HOUSE)
+}
+
 
 function checkIsOutage(info) {
   console.log("🌀 Checking power outage...")
@@ -195,6 +288,157 @@ async function updateChatTitle(isOutage) {
   }
 }
 
+// знімає скриншоти таблиць для кожної дати, на яку вже є графік
+async function captureFactTables(page) {
+  const container = page.locator(".discon-fact-tables").first()
+
+  const dates = await page
+    .locator(".discon-fact .dates .date")
+    .evaluateAll((els) =>
+      els.map((el) => ({
+        rel: el.getAttribute("rel"),
+        label: el.innerText.replace(/\s+/g, " ").trim(),
+      }))
+    )
+
+  const parts = []
+
+  for (const { rel, label } of dates) {
+    const table = container.locator(`.discon-fact-table[rel="${rel}"]`)
+
+    // таблиці немає (напр. для завтра є лише .info-tomorrow) — пропускаємо
+    if (!(await table.count())) {
+      console.log(`🟡 No schedule for "${label}".`)
+      continue
+    }
+
+    try {
+      // перемикаємо вкладку, щоб сайт показав потрібну таблицю
+      await page.locator(`.discon-fact .dates .date[rel="${rel}"]`).click()
+      await table.first().waitFor({ state: "visible", timeout: 5000 })
+      await page.waitForTimeout(500)
+
+      const text = (await table.first().innerText()).trim()
+      if (!text) continue
+
+      parts.push({
+        rel,
+        label,
+        text,
+        image: await table.first().screenshot({ type: "png" }),
+      })
+    } catch (error) {
+      console.log(`🟡 Schedule "${label}" skipped: ${error.message}`)
+    }
+  }
+
+  return parts
+}
+
+// склеює кілька скриншотів в одну картинку (вертикально, з підписами дат)
+async function stitchImages(browser, parts) {
+  const page = await browser.newPage()
+  try {
+    const blocks = parts
+      .map(
+        (p) => `
+        <div style="margin-bottom:16px">
+          <div style="font:600 18px sans-serif;margin-bottom:8px">${p.label}</div>
+          <img style="display:block" src="data:image/png;base64,${p.image.toString("base64")}">
+        </div>`
+      )
+      .join("")
+
+    await page.setContent(
+      `<body style="margin:0;padding:16px;background:#fff;display:inline-block">${blocks}</body>`,
+      { waitUntil: "load" }
+    )
+    await page.waitForFunction(() =>
+      [...document.images].every((img) => img.complete)
+    )
+
+    return await page.locator("body").screenshot({ type: "png" })
+  } finally {
+    await page.close()
+  }
+}
+
+const SCHEDULE_FILE = ".last-schedule.json"
+
+function loadLastSchedule() {
+  try {
+    return JSON.parse(fs.readFileSync(SCHEDULE_FILE, "utf8"))
+  } catch {
+    return {}
+  }
+}
+
+function saveLastSchedule(data) {
+  fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(data))
+}
+
+async function sendSchedule(info) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return
+
+  console.log("🌀 Checking schedule...")
+
+  const tables = info.factTables
+  if (!tables) {
+    console.log("🟡 Schedule not found.")
+    return
+  }
+
+  const hash = createHash("sha1").update(tables.text).digest("hex")
+  const last = loadLastSchedule()
+  if (last.hash === hash) {
+    console.log("🟡 Schedule not changed.")
+    return
+  }
+
+  const update = info.updateTimestamp?.split(" ").reverse().join(" ")
+  const caption = [
+    "🗓️ <b>Графік відключень</b>" + (tables.days > 1 ? " (сьогодні + завтра)" : ""),
+    TARGET ? `📍 ${ADDRESS}` : undefined,
+    update ? `📢 <i>${update}</i>` : undefined,
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n")
+
+  try {
+    const form = new FormData()
+    form.append("chat_id", TELEGRAM_CHAT_ID)
+    form.append("caption", caption)
+    form.append("parse_mode", "HTML")
+    form.append("disable_notification", String(checkIsNight()))
+    form.append(
+      "photo",
+      new Blob([tables.image], { type: "image/png" }),
+      "schedule.png"
+    )
+    if (last.message_id) {
+      form.append(
+        "reply_parameters",
+        JSON.stringify({
+          message_id: last.message_id,
+          allow_sending_without_reply: true,
+        })
+      )
+    }
+
+    const response = await fetch(`${TELEGRAM_API}/sendPhoto`, {
+      method: "POST",
+      body: form,
+    })
+    const data = await response.json()
+    if (!data.ok) throw Error(data.description)
+
+    saveLastSchedule({ message_id: data.result.message_id, hash })
+    console.log("🟢 Schedule sent.")
+  } catch (error) {
+    console.error(`❌ Sending schedule failed: ${error.message}.`)
+  }
+}
+
 async function sendNotification({ text, outageText }) {
   if (!TELEGRAM_BOT_TOKEN) throw Error("❌ Missing telegram bot token.")
   if (!TELEGRAM_CHAT_ID) throw Error("❌ Missing telegram chat id.")
@@ -265,6 +509,7 @@ async function run() {
   const isOutage = checkIsOutage(info) && !checkIsScheduled(info)
 
   await updateChatTitle(isOutage)
+  await sendSchedule(info)
 
   if (isOutage || loadLastMessage()?.outageText) {
     const message = generateMessage(info, isOutage)
