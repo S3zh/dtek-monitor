@@ -85,14 +85,24 @@ async function getInfo() {
     try {
       await fillAddress(browserPage)
 
-      const el = await browserPage.waitForSelector(
+      await browserPage.waitForSelector(
         "#discon-fact-tables, .discon-fact-tables",
         { state: "visible", timeout: 15000 }
       )
       await browserPage.waitForTimeout(1000)
-      const text = (await el.innerText()).trim()
-      if (text) {
-        factTables = { text, image: await el.screenshot({ type: "png" }) }
+
+      const parts = await captureFactTables(browserPage)
+
+      if (parts.length) {
+        factTables = {
+          // rel входить у хеш, щоб поява завтрашнього графіка теж вважалась зміною
+          text: parts.map((p) => `${p.rel}\n${p.text}`).join("\n---\n"),
+          image:
+            parts.length === 1
+              ? parts[0].image
+              : await stitchImages(browser, parts),
+          days: parts.length,
+        }
       }
     } catch (error) {
       console.log(`🟡 Fact tables not found: ${error.message}`)
@@ -278,6 +288,81 @@ async function updateChatTitle(isOutage) {
   }
 }
 
+// знімає скриншоти таблиць для кожної дати, на яку вже є графік
+async function captureFactTables(page) {
+  const container = page.locator(".discon-fact-tables").first()
+
+  const dates = await page
+    .locator(".discon-fact .dates .date")
+    .evaluateAll((els) =>
+      els.map((el) => ({
+        rel: el.getAttribute("rel"),
+        label: el.innerText.replace(/\s+/g, " ").trim(),
+      }))
+    )
+
+  const parts = []
+
+  for (const { rel, label } of dates) {
+    const table = container.locator(`.discon-fact-table[rel="${rel}"]`)
+
+    // таблиці немає (напр. для завтра є лише .info-tomorrow) — пропускаємо
+    if (!(await table.count())) {
+      console.log(`🟡 No schedule for "${label}".`)
+      continue
+    }
+
+    try {
+      // перемикаємо вкладку, щоб сайт показав потрібну таблицю
+      await page.locator(`.discon-fact .dates .date[rel="${rel}"]`).click()
+      await table.first().waitFor({ state: "visible", timeout: 5000 })
+      await page.waitForTimeout(500)
+
+      const text = (await table.first().innerText()).trim()
+      if (!text) continue
+
+      parts.push({
+        rel,
+        label,
+        text,
+        image: await table.first().screenshot({ type: "png" }),
+      })
+    } catch (error) {
+      console.log(`🟡 Schedule "${label}" skipped: ${error.message}`)
+    }
+  }
+
+  return parts
+}
+
+// склеює кілька скриншотів в одну картинку (вертикально, з підписами дат)
+async function stitchImages(browser, parts) {
+  const page = await browser.newPage()
+  try {
+    const blocks = parts
+      .map(
+        (p) => `
+        <div style="margin-bottom:16px">
+          <div style="font:600 18px sans-serif;margin-bottom:8px">${p.label}</div>
+          <img style="display:block" src="data:image/png;base64,${p.image.toString("base64")}">
+        </div>`
+      )
+      .join("")
+
+    await page.setContent(
+      `<body style="margin:0;padding:16px;background:#fff;display:inline-block">${blocks}</body>`,
+      { waitUntil: "load" }
+    )
+    await page.waitForFunction(() =>
+      [...document.images].every((img) => img.complete)
+    )
+
+    return await page.locator("body").screenshot({ type: "png" })
+  } finally {
+    await page.close()
+  }
+}
+
 const SCHEDULE_FILE = ".last-schedule.json"
 
 function loadLastSchedule() {
@@ -312,7 +397,7 @@ async function sendSchedule(info) {
 
   const update = info.updateTimestamp?.split(" ").reverse().join(" ")
   const caption = [
-    "🗓️ <b>Графік відключень</b>",
+    "🗓️ <b>Графік відключень</b>" + (tables.days > 1 ? " (сьогодні + завтра)" : ""),
     TARGET ? `📍 ${ADDRESS}` : undefined,
     update ? `📢 <i>${update}</i>` : undefined,
   ]
