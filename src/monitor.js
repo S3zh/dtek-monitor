@@ -28,6 +28,7 @@ import {
 } from "./helpers.js"
 
 import fs from "node:fs"
+import { createHash } from "node:crypto"
 
 let getInfoRetries = 0
 let sendNotificationRetries = 0
@@ -79,13 +80,25 @@ async function getInfo() {
 
     if (!info?.data) throw Error("power outage info missed")
 
-    // графік відключень, який сайт вбудовує у сторінку
-    const fact = await browserPage.evaluate(
-      () => window.DisconSchedule?.fact ?? null
-    );
-      
+    // чекаємо, поки скрипти сайту намалюють фактичний графік
+    let factTables = null
+    try {
+      await fillAddress(browserPage)
+
+      const el = await browserPage.waitForSelector(
+        "#discon-fact-tables, .discon-fact-tables",
+        { state: "visible", timeout: 15000 }
+      )
+      await browserPage.waitForTimeout(1000)
+      const text = (await el.innerText()).trim()
+      if (text) {
+        factTables = { text, image: await el.screenshot({ type: "png" }) }
+      }
+    } catch (error) {
+      console.log(`🟡 Fact tables not found: ${error.message}`)
+    }
     console.log("✅ Getting info finished.")
-        return { ...info, fact };
+    return { ...info, factTables }
   } catch (error) {
     console.error(`❌ Getting info failed: ${error.message}.`)
   } finally {
@@ -101,6 +114,69 @@ async function getInfo() {
 
   throw Error(`❌ Getting info failed after ${RETRIES_MAX_COUNT} retries.`)
 }
+
+async function closeModal(page) {
+  const modal = page.locator("#modal-attention.is-open")
+
+  try {
+    await modal.waitFor({ state: "visible", timeout: 5000 })
+  } catch {
+    return // попапа немає, нічого закривати
+  }
+
+  // кнопка закриття всередині діалогу (не оверлей)
+  const closeBtn = modal
+    .locator(".modal__container .modal__close")
+    .first()
+
+  if (await closeBtn.count()) {
+    await closeBtn.click()
+  } else {
+    await page.keyboard.press("Escape")
+  }
+
+  await modal.waitFor({ state: "hidden", timeout: 5000 }).catch(() => {})
+}
+
+// контейнер із полями форми графіка (а не форма скарг)
+const FORM = ".discon-inputs"
+
+async function fillAutocomplete(page, id, value) {
+  const scope = page.locator(FORM).first()
+  const input = scope.locator(`#${id}`).first()
+
+  await page.waitForFunction(
+    ({ form, inputId }) => {
+      const root = document.querySelector(form)
+      return root && !root.querySelector(`#${inputId}`)?.disabled
+    },
+    { form: FORM, inputId: id },
+    { timeout: 15000 }
+  )
+
+  await input.click()
+  await input.fill("")
+  await input.pressSequentially(value, { delay: 60 })
+
+  const items = scope.locator(`#${id}autocomplete-list > div`)
+  await items.first().waitFor({ state: "visible", timeout: 15000 })
+
+  // точний збіг за прихованим value, інакше перший пункт
+  const exact = items.filter({
+    has: page.locator(`input[type="hidden"][value="${value}"]`),
+  })
+  const target = (await exact.count()) ? exact.first() : items.first()
+  await target.click()
+}
+
+async function fillAddress(page) {
+  await page.evaluate(() => document.getElementById("modal-attention")?.remove())
+
+  if (REGION !== "k") await fillAutocomplete(page, "city", CITY)
+  await fillAutocomplete(page, "street", STREET)
+  await fillAutocomplete(page, "house_num", HOUSE)
+}
+
 
 function checkIsOutage(info) {
   console.log("🌀 Checking power outage...")
@@ -203,8 +279,6 @@ async function updateChatTitle(isOutage) {
 }
 
 const SCHEDULE_FILE = ".last-schedule.json"
-// можна задати вручну, якщо група не визначається автоматично, напр. "GPV4.1"
-const SCHEDULE_GROUP = process.env.SCHEDULE_GROUP
 
 function loadLastSchedule() {
   try {
@@ -218,156 +292,67 @@ function saveLastSchedule(data) {
   fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(data))
 }
 
-const formatMinutes = (m) =>
-  `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`
-
-// day: { "1": "yes" | "no" | "maybe" | "first" | "second" | "mfirst" | "msecond", ... "24": ... }
-// "1" = 00:00–01:00, ..., "24" = 23:00–24:00
-function dayToIntervals(day) {
-  // 48 півгодинних слотів: 0 — є світло, 1 — немає, 2 — можливе відключення
-  const slots = new Array(48).fill(0)
-
-  for (let hour = 1; hour <= 24; hour++) {
-    const i = (hour - 1) * 2
-    switch (day?.[hour]) {
-      case "no":
-        slots[i] = slots[i + 1] = 1
-        break
-      case "first":
-        slots[i] = 1
-        break
-      case "second":
-        slots[i + 1] = 1
-        break
-      case "maybe":
-        slots[i] = slots[i + 1] = 2
-        break
-      case "mfirst":
-        slots[i] = 2
-        break
-      case "msecond":
-        slots[i + 1] = 2
-        break
-    }
-  }
-
-  const intervals = []
-  let start = 0
-  for (let i = 1; i <= 48; i++) {
-    if (i === 48 || slots[i] !== slots[start]) {
-      if (slots[start] !== 0) {
-        intervals.push({
-          type: slots[start],
-          from: formatMinutes(start * 30),
-          to: formatMinutes(i * 30),
-        })
-      }
-      start = i
-    }
-  }
-  return intervals
-}
-
-function generateScheduleText(info) {
-  const fact = info?.fact
-  if (!fact?.data) return null
-
-  const group = SCHEDULE_GROUP || info?.data?.[HOUSE]?.sub_type_reason?.[0]
-  if (!group) return null
-
-  const todayTs = Number(fact.today)
-  const days = [
-    { label: "Сьогодні", ts: todayTs },
-    { label: "Завтра", ts: todayTs + 86400 },
-  ]
-
-  const blocks = []
-  for (const { label, ts } of days) {
-    const day = fact.data[String(ts)]?.[group]
-    if (!day) continue
-
-    const date = new Date(ts * 1000).toLocaleDateString("uk-UA", {
-      timeZone: "Europe/Kyiv",
-      day: "2-digit",
-      month: "2-digit",
-    })
-    const intervals = dayToIntervals(day)
-
-    blocks.push(
-      [
-        `📅 <b>${label} (${date}):</b>`,
-        ...(intervals.length
-          ? intervals.map(
-              ({ type, from, to }) =>
-                `${type === 1 ? "🪫" : "❓"} <code>${from} — ${to}</code>`
-            )
-          : ["💡 Відключень не заплановано"]),
-      ].join("\n")
-    )
-  }
-
-  if (!blocks.length) return null
-
-  return [
-    "🗓️ <b>Графік відключень</b>",
-    TARGET ? `📍 ${ADDRESS}` : undefined,
-    `👥 Група: <code>${group}</code>`,
-    "",
-    blocks.join("\n\n"),
-    "",
-    `📢 <i>${fact.update ?? ""}</i>`,
-  ]
-    .filter((line) => line !== undefined)
-    .join("\n")
-}
-
 async function sendSchedule(info) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return
 
   console.log("🌀 Checking schedule...")
 
-  const text = generateScheduleText(info)
-  if (!text) {
+  const tables = info.factTables
+  if (!tables) {
     console.log("🟡 Schedule not found.")
     return
   }
 
-  // порівнюємо без рядка "оновлено", щоб не слати дублікати
-  const signature = text.replace(/📢.*$/s, "")
+  const hash = createHash("sha1").update(tables.text).digest("hex")
   const last = loadLastSchedule()
-  if (last.signature === signature) {
+  if (last.hash === hash) {
     console.log("🟡 Schedule not changed.")
     return
   }
 
+  const update = info.updateTimestamp?.split(" ").reverse().join(" ")
+  const caption = [
+    "🗓️ <b>Графік відключень</b>",
+    TARGET ? `📍 ${ADDRESS}` : undefined,
+    update ? `📢 <i>${update}</i>` : undefined,
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n")
+
   try {
-    const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+    const form = new FormData()
+    form.append("chat_id", TELEGRAM_CHAT_ID)
+    form.append("caption", caption)
+    form.append("parse_mode", "HTML")
+    form.append("disable_notification", String(checkIsNight()))
+    form.append(
+      "photo",
+      new Blob([tables.image], { type: "image/png" }),
+      "schedule.png"
+    )
+    if (last.message_id) {
+      form.append(
+        "reply_parameters",
+        JSON.stringify({
+          message_id: last.message_id,
+          allow_sending_without_reply: true,
+        })
+      )
+    }
+
+    const response = await fetch(`${TELEGRAM_API}/sendPhoto`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text,
-        parse_mode: "HTML",
-        disable_notification: checkIsNight(),
-        reply_parameters: last.message_id
-          ? {
-              message_id: last.message_id,
-              allow_sending_without_reply: true,
-            }
-          : undefined,
-      }),
+      body: form,
     })
     const data = await response.json()
     if (!data.ok) throw Error(data.description)
 
-    saveLastSchedule({ message_id: data.result.message_id, signature })
+    saveLastSchedule({ message_id: data.result.message_id, hash })
     console.log("🟢 Schedule sent.")
   } catch (error) {
-    // збій графіка не має ламати моніторинг аварійних відключень
     console.error(`❌ Sending schedule failed: ${error.message}.`)
   }
 }
-
 
 async function sendNotification({ text, outageText }) {
   if (!TELEGRAM_BOT_TOKEN) throw Error("❌ Missing telegram bot token.")
