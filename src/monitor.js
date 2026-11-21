@@ -27,6 +27,8 @@ import {
   saveLastMessage,
 } from "./helpers.js"
 
+import fs from "node:fs"
+
 let getInfoRetries = 0
 let sendNotificationRetries = 0
 
@@ -77,8 +79,13 @@ async function getInfo() {
 
     if (!info?.data) throw Error("power outage info missed")
 
+    // графік відключень, який сайт вбудовує у сторінку
+    const fact = await browserPage.evaluate(
+      () => window.DisconSchedule?.fact ?? null
+    );
+      
     console.log("✅ Getting info finished.")
-    return info
+        return { ...info, fact };
   } catch (error) {
     console.error(`❌ Getting info failed: ${error.message}.`)
   } finally {
@@ -195,6 +202,173 @@ async function updateChatTitle(isOutage) {
   }
 }
 
+const SCHEDULE_FILE = ".last-schedule.json"
+// можна задати вручну, якщо група не визначається автоматично, напр. "GPV4.1"
+const SCHEDULE_GROUP = process.env.SCHEDULE_GROUP
+
+function loadLastSchedule() {
+  try {
+    return JSON.parse(fs.readFileSync(SCHEDULE_FILE, "utf8"))
+  } catch {
+    return {}
+  }
+}
+
+function saveLastSchedule(data) {
+  fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(data))
+}
+
+const formatMinutes = (m) =>
+  `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`
+
+// day: { "1": "yes" | "no" | "maybe" | "first" | "second" | "mfirst" | "msecond", ... "24": ... }
+// "1" = 00:00–01:00, ..., "24" = 23:00–24:00
+function dayToIntervals(day) {
+  // 48 півгодинних слотів: 0 — є світло, 1 — немає, 2 — можливе відключення
+  const slots = new Array(48).fill(0)
+
+  for (let hour = 1; hour <= 24; hour++) {
+    const i = (hour - 1) * 2
+    switch (day?.[hour]) {
+      case "no":
+        slots[i] = slots[i + 1] = 1
+        break
+      case "first":
+        slots[i] = 1
+        break
+      case "second":
+        slots[i + 1] = 1
+        break
+      case "maybe":
+        slots[i] = slots[i + 1] = 2
+        break
+      case "mfirst":
+        slots[i] = 2
+        break
+      case "msecond":
+        slots[i + 1] = 2
+        break
+    }
+  }
+
+  const intervals = []
+  let start = 0
+  for (let i = 1; i <= 48; i++) {
+    if (i === 48 || slots[i] !== slots[start]) {
+      if (slots[start] !== 0) {
+        intervals.push({
+          type: slots[start],
+          from: formatMinutes(start * 30),
+          to: formatMinutes(i * 30),
+        })
+      }
+      start = i
+    }
+  }
+  return intervals
+}
+
+function generateScheduleText(info) {
+  const fact = info?.fact
+  if (!fact?.data) return null
+
+  const group = SCHEDULE_GROUP || info?.data?.[HOUSE]?.sub_type_reason?.[0]
+  if (!group) return null
+
+  const todayTs = Number(fact.today)
+  const days = [
+    { label: "Сьогодні", ts: todayTs },
+    { label: "Завтра", ts: todayTs + 86400 },
+  ]
+
+  const blocks = []
+  for (const { label, ts } of days) {
+    const day = fact.data[String(ts)]?.[group]
+    if (!day) continue
+
+    const date = new Date(ts * 1000).toLocaleDateString("uk-UA", {
+      timeZone: "Europe/Kyiv",
+      day: "2-digit",
+      month: "2-digit",
+    })
+    const intervals = dayToIntervals(day)
+
+    blocks.push(
+      [
+        `📅 <b>${label} (${date}):</b>`,
+        ...(intervals.length
+          ? intervals.map(
+              ({ type, from, to }) =>
+                `${type === 1 ? "🪫" : "❓"} <code>${from} — ${to}</code>`
+            )
+          : ["💡 Відключень не заплановано"]),
+      ].join("\n")
+    )
+  }
+
+  if (!blocks.length) return null
+
+  return [
+    "🗓️ <b>Графік відключень</b>",
+    TARGET ? `📍 ${ADDRESS}` : undefined,
+    `👥 Група: <code>${group}</code>`,
+    "",
+    blocks.join("\n\n"),
+    "",
+    `📢 <i>${fact.update ?? ""}</i>`,
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n")
+}
+
+async function sendSchedule(info) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return
+
+  console.log("🌀 Checking schedule...")
+
+  const text = generateScheduleText(info)
+  if (!text) {
+    console.log("🟡 Schedule not found.")
+    return
+  }
+
+  // порівнюємо без рядка "оновлено", щоб не слати дублікати
+  const signature = text.replace(/📢.*$/s, "")
+  const last = loadLastSchedule()
+  if (last.signature === signature) {
+    console.log("🟡 Schedule not changed.")
+    return
+  }
+
+  try {
+    const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: "HTML",
+        disable_notification: checkIsNight(),
+        reply_parameters: last.message_id
+          ? {
+              message_id: last.message_id,
+              allow_sending_without_reply: true,
+            }
+          : undefined,
+      }),
+    })
+    const data = await response.json()
+    if (!data.ok) throw Error(data.description)
+
+    saveLastSchedule({ message_id: data.result.message_id, signature })
+    console.log("🟢 Schedule sent.")
+  } catch (error) {
+    // збій графіка не має ламати моніторинг аварійних відключень
+    console.error(`❌ Sending schedule failed: ${error.message}.`)
+  }
+}
+
+
 async function sendNotification({ text, outageText }) {
   if (!TELEGRAM_BOT_TOKEN) throw Error("❌ Missing telegram bot token.")
   if (!TELEGRAM_CHAT_ID) throw Error("❌ Missing telegram chat id.")
@@ -265,6 +439,7 @@ async function run() {
   const isOutage = checkIsOutage(info) && !checkIsScheduled(info)
 
   await updateChatTitle(isOutage)
+  await sendSchedule(info)
 
   if (isOutage || loadLastMessage()?.outageText) {
     const message = generateMessage(info, isOutage)
