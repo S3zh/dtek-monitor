@@ -33,6 +33,8 @@ import { createHash } from "node:crypto"
 let getInfoRetries = 0
 let sendNotificationRetries = 0
 
+const SCHEDULE_FILE = "artifacts/.last-schedule.json"
+
 async function getInfo() {
   console.log("🌀 Getting info...")
 
@@ -362,8 +364,6 @@ async function stitchImages(browser, parts) {
     await page.close()
   }
 }
-
-const SCHEDULE_FILE = ".last-schedule.json"
 
 function loadLastSchedule() {
   try {
